@@ -1,0 +1,623 @@
+"""Blast Radius selector: patch -> tests that can catch it -> split across workers.
+
+Run:  python -m blast.select            (reads $DATA_DIR, default /data)
+Prints one JSON line per commit on stdout; everything else goes to stderr.
+"""
+
+from __future__ import annotations
+
+import ast
+import io
+import json
+import os
+import re
+import sys
+import time
+import tokenize
+from dataclasses import dataclass, field
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+DATA_DIR = os.environ.get("DATA_DIR", "/data")
+MAP_DIR = os.environ.get("MAP_DIR", os.path.join(ROOT, "map"))
+SQLGLOT_DIR = os.environ.get("SQLGLOT_DIR", os.path.join(ROOT, "vendor", "sqlglot"))
+MAX_WORKERS = 8
+WORKER_COST = 2000  # ms
+
+
+def log(*a):
+    print(*a, file=sys.stderr)
+
+
+# --------------------------------------------------------------------------- patch parsing
+
+
+@dataclass
+class FilePatch:
+    old_path: str | None
+    new_path: str | None
+    hunks: list = field(default_factory=list)  # (old_start, old_len, new_start, new_len, lines)
+
+    @property
+    def path(self):
+        return self.old_path or self.new_path
+
+    def changed_old_lines(self):
+        """Old line numbers that were removed or replaced."""
+        out = set()
+        for old_start, _, _, _, lines in self.hunks:
+            n = old_start
+            for ln in lines:
+                if ln.startswith("-"):
+                    out.add(n)
+                    n += 1
+                elif ln.startswith(" "):
+                    n += 1
+        return out
+
+    def insert_points(self):
+        """{P: indent} for pure insertions between old lines P and P+1 (no old line
+        removed there). indent = indentation of the first non-blank inserted line."""
+        out = {}
+        for old_start, old_len, _, _, lines in self.hunks:
+            n = old_start if old_len else old_start + 1
+            prev_removed = False
+            for ln in lines:
+                if ln.startswith("-"):
+                    prev_removed = True
+                    n += 1
+                elif ln.startswith(" "):
+                    prev_removed = False
+                    n += 1
+                elif ln.startswith("+") and not prev_removed:
+                    body = ln[1:]
+                    if body.strip() and out.get(n - 1) is None:
+                        out[n - 1] = len(body) - len(body.lstrip())
+                    else:
+                        out.setdefault(n - 1, None)
+        return out
+
+    def added_text(self):
+        return "\n".join(ln[1:] for h in self.hunks for ln in h[4] if ln.startswith("+"))
+
+    def removed_text(self):
+        return "\n".join(ln[1:] for h in self.hunks for ln in h[4] if ln.startswith("-"))
+
+
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def parse_patch(text):
+    files = []
+    cur = None
+    hunk = None
+    old_left = new_left = 0  # lines still expected in the current hunk
+    for line in text.splitlines():
+        if old_left > 0 or new_left > 0:
+            tag = line[:1] if line else " "
+            body = line if line else " "
+            if tag == "\\":  # "\ No newline at end of file"
+                continue
+            hunk[4].append(body)
+            if tag in (" ", "-"):
+                old_left -= 1
+            if tag in (" ", "+"):
+                new_left -= 1
+            continue
+        if line.startswith("diff --git "):
+            m = re.match(r"diff --git a/(.*) b/(.*)", line)
+            cur = FilePatch(m.group(1), m.group(2)) if m else FilePatch(None, None)
+            files.append(cur)
+            hunk = None
+            continue
+        if cur is None:
+            continue
+        if line.startswith("--- "):
+            p = line[4:].split("\t")[0]
+            cur.old_path = None if p == "/dev/null" else p[2:] if p.startswith("a/") else p
+        elif line.startswith("+++ "):
+            p = line[4:].split("\t")[0]
+            cur.new_path = None if p == "/dev/null" else p[2:] if p.startswith("b/") else p
+        elif line.startswith("rename from "):
+            cur.old_path = line[len("rename from ") :]
+        elif line.startswith("rename to "):
+            cur.new_path = line[len("rename to ") :]
+        else:
+            m = HUNK_RE.match(line)
+            if m:
+                a, b, c, d = m.groups()
+                b = int(b) if b is not None else 1
+                d = int(d) if d is not None else 1
+                hunk = [int(a), b, int(c), d, []]
+                cur.hunks.append(hunk)
+                old_left, new_left = b, d
+    return files
+
+
+def apply_patch(old_text, fp: FilePatch):
+    """Apply one file's hunks to old text. Returns new text or None if it doesn't apply."""
+    old = old_text.splitlines(keepends=True)
+    out = []
+    i = 0
+    for old_start, _, _, _, lines in fp.hunks:
+        start = old_start - 1 if old_start else 0
+        if start < i:
+            return None
+        out.extend(old[i:start])
+        i = start
+        for ln in lines:
+            tag, body = ln[:1], ln[1:]
+            if tag == " ":
+                if i >= len(old) or old[i].rstrip("\r\n") != body:
+                    return None
+                out.append(old[i])
+                i += 1
+            elif tag == "-":
+                i += 1
+            elif tag == "+":
+                out.append(body + "\n")
+    out.extend(old[i:])
+    return "".join(out)
+
+
+# --------------------------------------------------------------------------- source helpers
+
+_src_cache: dict = {}
+
+
+def old_source(path):
+    if path not in _src_cache:
+        p = os.path.join(SQLGLOT_DIR, path)
+        try:
+            with open(p, encoding="utf-8") as fh:
+                _src_cache[path] = fh.read()
+        except OSError:
+            _src_cache[path] = None
+    return _src_cache[path]
+
+
+def code_tokens(text):
+    """Token stream without comments / layout, or None if it doesn't tokenize."""
+    try:
+        toks = tokenize.generate_tokens(io.StringIO(text).readline)
+        return [
+            (t.type, t.string)
+            for t in toks
+            if t.type not in (tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE)
+        ]
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return None
+
+
+class Scopes:
+    """Statement/function/class spans of one old source file."""
+
+    def __init__(self, text):
+        self.tree = ast.parse(text)
+        self.funcs = []  # (start, body_start, end, node)
+        self.classes = []  # (start, end, node, qualname)
+        self.stmts = []  # (start, end, node)
+        self._walk(self.tree, "")
+
+    def _walk(self, node, prefix):
+        for child in ast.iter_child_nodes(node):
+            qual = prefix
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                start = min([child.lineno] + [d.lineno for d in child.decorator_list])
+                self.funcs.append((start, child.body[0].lineno, child.end_lineno, child))
+                qual = f"{prefix}{child.name}.<locals>."
+            elif isinstance(child, ast.ClassDef):
+                start = min([child.lineno] + [d.lineno for d in child.decorator_list])
+                self.classes.append((start, child.end_lineno, child, prefix + child.name))
+                qual = f"{prefix}{child.name}."
+            if isinstance(child, ast.stmt):
+                self.stmts.append((child.lineno, child.end_lineno, child))
+            self._walk(child, qual)
+
+    def innermost_func(self, line):
+        best = None
+        for s, b, e, n in self.funcs:
+            if s <= line <= e and (best is None or s >= best[0]):
+                best = (s, b, e, n)
+        return best
+
+    def innermost_class(self, line):
+        best = None
+        for s, e, n, q in self.classes:
+            if s <= line <= e and (best is None or s >= best[0]):
+                best = (s, e, n, q)
+        return best
+
+    def innermost_stmt(self, lo, hi, within):
+        """Innermost statement containing lines lo..hi, inside span `within` (s, e)."""
+        best = None
+        for s, e, n in self.stmts:
+            if s <= lo and hi <= e and within[0] <= s and e <= within[1]:
+                if best is None or (s, -e) > (best[0], -best[1]):
+                    best = (s, e, n)
+        return best
+
+
+def header_end(node):
+    """Last line of a statement's own code: the whole statement if simple, or the
+    line before its first child statement if compound."""
+    body = getattr(node, "body", None)
+    if isinstance(body, list) and body and isinstance(body[0], ast.stmt):
+        return max(node.lineno, body[0].lineno - 1)
+    return node.end_lineno
+
+
+_scope_cache: dict = {}
+
+
+def scopes_for(path):
+    if path not in _scope_cache:
+        src = old_source(path)
+        try:
+            _scope_cache[path] = Scopes(src) if src is not None else None
+        except SyntaxError:
+            _scope_cache[path] = None
+    return _scope_cache[path]
+
+
+WORD_RE = re.compile(r"""["']([A-Za-z_][A-Za-z0-9_ ]{2,})["']""")
+
+
+ENTRY_RE = re.compile(r"^\s*exp\.([A-Za-z_]\w*)(?:\.[A-Za-z_][\w.]*)?\s*(?::.*|,)\s*(?:#.*)?$")
+
+
+def entry_refs(fp):
+    """If every changed line in this file is a dict/set entry keyed by `exp.Name`,
+    return the referenced expression class names; otherwise None."""
+    if fp is None:
+        return None
+    refs = set()
+    for h in fp.hunks:
+        for ln in h[4]:
+            if ln[:1] not in "+-" or not ln[1:].strip():
+                continue
+            mm = ENTRY_RE.match(ln[1:])
+            if not mm:
+                return None
+            refs.add(mm.group(1))
+    return refs or None
+
+
+def patch_words(fp):
+    """String literals on the changed lines (e.g. SQL function names)."""
+    if fp is None:
+        return []
+    text = fp.added_text() + "\n" + fp.removed_text()
+    return sorted({w.strip() for w in WORD_RE.findall(text) if len(w.strip()) >= 3})
+
+
+# --------------------------------------------------------------------------- the maps
+
+
+class Maps:
+    def __init__(self):
+        with open(os.path.join(MAP_DIR, "covmap.json")) as fh:
+            c = json.load(fh)
+        with open(os.path.join(MAP_DIR, "meta.json")) as fh:
+            m = json.load(fh)
+        self.tests = c["tests"]
+        self.runtime = c["runtime"]
+        self.sets = c["sets"]
+        self.files = {f: {int(k): v for k, v in lines.items()} for f, lines in c["files"].items()}
+        self.all = set(range(len(self.tests)))
+        self.meta = m
+        self.test_files = {k: set(v) for k, v in m["test_files"].items()}
+        self.file_of_dialect = {}
+        for d, fs in m["dialect_files"].items():
+            for f in fs:
+                self.file_of_dialect[f] = d
+        covered = set()
+        for s in self.sets:
+            covered.update(s)
+        # Tests that run no measured line (subprocess / static inspection tests).
+        self.uncovered = self.all - covered
+        self._file_union = {}
+        self.traced_classes = set(m.get("traced_classes", []))
+        self.class_tests = m.get("class_tests", {})
+        self._test_src = {}
+
+    def expression_tests(self, name):
+        """Tests that instantiate the expression class `name` (or a subclass)."""
+        if not hasattr(self, "_expr_index"):
+            idx = {}
+            for key, ids in self.class_tests.items():
+                path, qual = key.split(":", 1)
+                if path.startswith("sqlglot/expressions/"):
+                    idx.setdefault(qual.rsplit(".", 1)[-1], set()).update(ids)
+            self._expr_index = idx
+        return self._expr_index.get(name, set())
+
+    def tests_mentioning(self, words):
+        """Tests whose own function source contains any of `words` (case-insensitive)."""
+        words = [w.lower() for w in words]
+        out = set()
+        if not words:
+            return out
+        for path, spans in self.meta["test_spans"].items():
+            src = self._test_src.get(path)
+            if src is None:
+                try:
+                    with open(os.path.join(SQLGLOT_DIR, path), encoding="utf-8") as fh:
+                        src = fh.read().lower().splitlines()
+                except OSError:
+                    src = []
+                self._test_src[path] = src
+            for a, b, i in spans:
+                body = "\n".join(src[a - 1 : b])
+                if any(w in body for w in words):
+                    out.add(i)
+        return out
+
+    def line(self, path, line):
+        k = self.files.get(path, {}).get(line)
+        return set(self.sets[k]) if k is not None else set()
+
+    def span(self, path, lo, hi):
+        lines = self.files.get(path, {})
+        out = set()
+        for ln, k in lines.items():
+            if lo <= ln <= hi:
+                out.update(self.sets[k])
+        return out
+
+    def file_union(self, path):
+        if path not in self._file_union:
+            out = set()
+            for k in set(self.files.get(path, {}).values()):
+                out.update(self.sets[k])
+            self._file_union[path] = out
+        return self._file_union[path]
+
+    def dialect_family_tests(self, dialect):
+        out = set()
+        for d in self.meta["dialect_family"].get(dialect, [dialect]):
+            out.update(self.meta["dialect_tests"].get(d, []))
+        return out
+
+    def importer_closure(self, test_path):
+        """Test files that import test_path (transitively), including itself."""
+        mod = test_path[:-3] if test_path.endswith(".py") else test_path
+        seen = {test_path}
+        todo = [mod]
+        while todo:
+            cur = todo.pop()
+            for f in self.meta["importers"].get(cur, []):
+                if f not in seen:
+                    seen.add(f)
+                    todo.append(f[:-3])
+        return seen
+
+
+# --------------------------------------------------------------------------- selection
+
+
+class Selector:
+    def __init__(self, maps: Maps):
+        self.m = maps
+
+    def select(self, patch_text):
+        reasons = []
+        sel = set()
+        for fp in parse_patch(patch_text):
+            got, why = self.select_file(fp)
+            sel |= got
+            reasons.append(f"{fp.path}:{why}:{len(got)}")
+        return sel, reasons
+
+    def select_file(self, fp: FilePatch):
+        m = self.m
+        path = fp.path
+        if path is None:
+            return set(), "nopath"
+
+        if path.startswith("tests/fixtures/"):
+            if fp.old_path is None:
+                return set(), "new-fixture"
+            return set(m.meta["fixture_tests"].get(path, [])), "fixture"
+
+        is_py = path.endswith(".py")
+        in_pkg = path.startswith("sqlglot/")
+        in_tests = path.startswith("tests/")
+        if not is_py or not (in_pkg or in_tests):
+            return set(), "non-code"
+
+        old = old_source(fp.old_path) if fp.old_path else None
+        if fp.new_path is None:  # deleted file
+            if in_tests:
+                return self.test_file_all(path), "deleted-test-file"
+            return set(m.all), "deleted-module"
+        if old is None:  # new file
+            return set(), "new-file"
+
+        new = apply_patch(old, fp)
+        if new is None:
+            log(f"  ! patch does not apply cleanly to {path}; being conservative")
+            return (self.test_file_all(path) if in_tests else set(m.all)), "noapply"
+        try:
+            compile(new, path, "exec")
+        except SyntaxError:
+            return (self.test_file_all(path) if in_tests else set(m.all)), "syntax-error"
+        if code_tokens(old) == code_tokens(new):
+            return set(), "comment-only"
+
+        sc = scopes_for(path)
+        if sc is None:
+            return set(m.all), "noscope"
+
+        sel = set()
+        kinds = set()
+        for ln in sorted(fp.changed_old_lines()):
+            got, kind = self.for_line(path, sc, ln, ln, fp=fp)
+            sel |= got
+            kinds.add(kind)
+        for p, indent in sorted(fp.insert_points().items()):
+            got, kind = self.for_line(path, sc, p, p + 1, insertion=True, indent=indent, fp=fp)
+            sel |= got
+            kinds.add(kind)
+        return sel, "+".join(sorted(kinds))
+
+    def test_file_all(self, path):
+        out = set()
+        for f in self.m.importer_closure(path):
+            out |= self.m.test_files.get(f, set())
+        return out
+
+    def module_level(self, path, sc=None, line=None, fp=None):
+        """A change outside any function body: it runs at import or class creation."""
+        m = self.m
+        if path.startswith("tests/"):
+            return self.test_file_all(path), "test-module"
+        c = sc.innermost_class(line) if sc is not None and line is not None else None
+        if c is not None:
+            key = f"{path}:{c[3]}"
+            if key in m.traced_classes:
+                # Class attributes of an expression/parser/generator/tokenizer class only
+                # matter to tests that build an instance of it (or of a subclass). Names
+                # added or removed in the patch may also change what other SQL parses to.
+                got = set(m.class_tests.get(key, []))
+                refs = entry_refs(fp)
+                if refs:
+                    # Every changed line is a `exp.Foo: ...` / `exp.Foo,` entry: it only
+                    # matters when an instance of Foo meets an instance of this class.
+                    users = set()
+                    for r in refs:
+                        users |= m.expression_tests(r)
+                    return got & users, "class-entry"
+                got |= m.tests_mentioning(patch_words(fp))
+                return got, "class-traced"
+        d = m.file_of_dialect.get(path)
+        if d is not None:
+            return m.dialect_family_tests(d) | m.uncovered, "dialect-module"
+        return set(m.all), "core-module"
+
+    def for_line(self, path, sc: Scopes, lo, hi, insertion=False, indent=None, fp=None):
+        m = self.m
+        lo = max(lo, 1)
+        f = sc.innermost_func(lo) if not insertion else None
+        if insertion:
+            # Inside a function only if the inserted code is indented deeper than the
+            # def and the point is within that function's body.
+            f1 = sc.innermost_func(lo)
+            if f1 is not None and lo >= f1[1] - 1:
+                def_indent = f1[3].col_offset
+                if indent is None or indent > def_indent:
+                    f = f1
+        if f is None:
+            cls_line = None if (insertion and indent == 0) else lo
+            return self.module_level(path, sc, cls_line, fp)
+
+        fstart, body_start, fend, fnode = f
+        if path.startswith("tests/") and fnode.name.startswith("test"):
+            # A test function itself: just that test (its id comes from the span table).
+            for a, b, i in m.meta["test_spans"].get(path, []):
+                if a <= lo <= b:
+                    return {i}, "test-body"
+        if lo < body_start and not insertion:
+            # def line / decorator / signature: anyone who calls it.
+            return m.span(path, body_start, fend), "func-header"
+        # Innermost statement inside the function that contains the change.
+        hi_eff = hi if insertion else lo
+        st = sc.innermost_stmt(lo, hi_eff, (body_start, fend))
+        if st is None:
+            return m.span(path, body_start, fend) | m.line(path, body_start), "func-body"
+        s, e, node = st
+        # Coverage on 3.12+ credits the line each sub-expression runs on, so take the
+        # union over the statement's own lines (the header only, for compound ones).
+        got = m.span(path, s, header_end(node))
+        if insertion or hasattr(node, "body"):
+            return got, "block"  # every test that reached this block
+        return got, "stmt"
+
+
+# --------------------------------------------------------------------------- tests.json
+
+
+def load_tests_json(maps: Maps, path):
+    """Map our test ids to the grader's numbers; runtimes in whole milliseconds.
+
+    Format: {"tests": [{"number", "id" (pytest node id), "file", "seconds"}], "skipped": [...]}
+    Returns (to_theirs, runtime_ms, unknown) where unknown lists grader tests we have no
+    map entry for, as (number, file).
+    """
+    with open(path) as fh:
+        raw = json.load(fh)
+    ours = {t: i for i, t in enumerate(maps.tests)}
+    to_theirs, runtime, unknown = {}, {}, []
+    for e in raw["tests"]:
+        num = int(e["number"])
+        runtime[num] = int(round(float(e["seconds"]) * 1000))
+        i = ours.get(e["id"])
+        if i is None:
+            unknown.append((num, e.get("file", ""), e["id"]))
+        else:
+            to_theirs[i] = num
+    return to_theirs, runtime, unknown
+
+
+# --------------------------------------------------------------------------- scheduling
+
+
+def schedule(nums, runtime):
+    """Longest-first onto the least loaded worker; pick the worker count with lowest cost."""
+    if not nums:
+        return [], 0
+    items = sorted(nums, key=lambda n: (-runtime.get(n, 0), n))
+    best = None
+    for k in range(1, min(MAX_WORKERS, len(items)) + 1):
+        loads = [0] * k
+        bins = [[] for _ in range(k)]
+        for n in items:
+            j = loads.index(min(loads))
+            loads[j] += runtime.get(n, 0)
+            bins[j].append(n)
+        cost = max(loads) + WORKER_COST * k
+        if best is None or cost < best[1]:
+            best = (bins, cost)
+    return best
+
+
+# --------------------------------------------------------------------------- main
+
+
+def main():
+    t0 = time.process_time()
+    maps = Maps()
+    sel = Selector(maps)
+    tests_json = os.path.join(DATA_DIR, "tests.json")
+    if os.path.exists(tests_json):
+        to_theirs, runtime, unknown = load_tests_json(maps, tests_json)
+        if unknown:
+            log(f"{len(unknown)} tests in tests.json not in our map, e.g. {unknown[:3]}")
+    else:
+        to_theirs = {i: i for i in range(len(maps.tests))}
+        runtime = {i: int(round(r * 1000)) for i, r in enumerate(maps.runtime)}
+        log("no tests.json; using our own numbering")
+
+    commit_dir = os.path.join(DATA_DIR, "commits")
+    total = 0
+    for fn in sorted(os.listdir(commit_dir)):
+        if not fn.endswith(".patch"):
+            continue
+        cid = fn[: -len(".patch")]
+        with open(os.path.join(commit_dir, fn), encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+        try:
+            ours, reasons = sel.select(text)
+        except Exception as e:  # never crash: fall back to everything
+            log(f"{cid}: selector error {e!r}; selecting all")
+            ours, reasons = set(maps.all), ["error"]
+        nums = sorted({to_theirs[i] for i in ours if i in to_theirs})
+        bins, cost = schedule(nums, runtime)
+        total += cost
+        print(json.dumps({"commit": cid, "workers": bins}, separators=(",", ":")), flush=True)
+        log(f"{cid}: {len(nums)} tests, est {cost / 1000:.1f}s  [{'; '.join(reasons)}]")
+    log(f"estimated test cost {total / 1000:.1f}s, cpu {time.process_time() - t0:.2f}s")
+
+
+if __name__ == "__main__":
+    main()
