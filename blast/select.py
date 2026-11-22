@@ -497,7 +497,8 @@ class Selector:
             old = old_source(path)
             new = apply_patch(old, fp) if old is not None and fp.hunks else None
             if new is not None:
-                self._step = [("fixture", path, None, new, None)]
+                readers = sorted(m.tests[i] for i in m.fixture_readers.get(path, ()))
+                self._step = [("fixture", path, None, new, readers)]
             # Tests traced reading this exact file will almost surely fail.
             self.direct |= set(m.fixture_readers.get(path, ()))
             return set(m.meta["fixture_tests"].get(path, [])), "fixture"
@@ -607,6 +608,28 @@ class Selector:
         return set(m.all), "core-module"
 
     def for_line(self, path, sc: Scopes, lo, hi, insertion=False, indent=None, fp=None):
+        got, kind = self._for_line(path, sc, lo, hi, insertion, indent, fp)
+        m = self.m
+        if path.startswith("sqlglot/"):
+            f = sc.outermost_func(max(lo, 1))
+            qual = sc.func_qual[id(f[3])] if f else None
+            # Runs once per generator class per process (cached): coverage credits only
+            # the first test per class, but every generating test depends on it.
+            if path == "sqlglot/generator.py" and (
+                qual == "_build_dispatch" or (qual == "Generator.__init__" and 1004 <= lo <= 1009)
+            ):
+                return got | set(m.class_tests.get("sqlglot/generator.py:Generator", [])), "once"
+            # A changed line that ran at import (factory bodies, lazy loaders, ...) has
+            # effects baked in at import time: treat it like module-level code.
+            ran = m.import_ran.get(path, ())
+            if kind in ("stmt", "block", "func-body") and (
+                (not insertion and lo in ran) or (insertion and lo in ran and f and lo >= f[1])
+            ):
+                wide, _ = self.module_level(path, sc, lo, fp)
+                return got | wide, "import-run"
+        return got, kind
+
+    def _for_line(self, path, sc: Scopes, lo, hi, insertion=False, indent=None, fp=None):
         m = self.m
         lo = max(lo, 1)
         f = sc.innermost_func(lo) if not insertion else None

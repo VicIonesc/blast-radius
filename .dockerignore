@@ -1,0 +1,7 @@
+.venv/
+vendor/
+build/
+kit/
+.git/
+**/__pycache__/
+output.jsonl

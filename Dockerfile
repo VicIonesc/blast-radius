@@ -11,6 +11,11 @@ RUN mkdir -p /opt/sqlglot \
  && python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests || true \
  && chmod -R a+rX /opt/sqlglot
 
+# The exact package set the organizers labeled with, so the test modules our
+# verifier imports behave like theirs.
+COPY requirements.lock /tmp/requirements.lock
+RUN pip install --no-cache-dir -r /tmp/requirements.lock
+
 WORKDIR /app
 COPY blast/ /app/blast/
 COPY map/ /app/map/

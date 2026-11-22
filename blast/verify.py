@@ -260,6 +260,7 @@ class Verifier:
         """Apply the patch inside the child. plan: list of (kind, path, old_text, new_text, funcs)."""
         overrides = {}
         reexec = []
+        self._readers = {}
         for kind, path, old, new, funcs in plan:
             if kind == "code":
                 old_code = compile(old, os.path.join(self.dir, path), "exec")
@@ -280,6 +281,7 @@ class Verifier:
                         fn.__code__ = cands[0]
             elif kind == "fixture":
                 overrides[os.path.join(self.dir, path)] = new
+                self._readers[os.path.join(self.dir, path)] = set(funcs or ())
             elif kind == "test":
                 reexec.append((path, new))  # new is None: unchanged dependent, re-run as is
         return overrides, reexec
@@ -334,8 +336,10 @@ class Verifier:
                 mods[path] = m
             run_suite(mods.get, nodes, limits, emit)
             for p in overrides:
-                if p not in read:
-                    emit("X override never read: " + p)  # patch didn't reach the tests
+                # A known reader of this fixture ran but never saw the patched text:
+                # the override missed, so its "pass" means nothing.
+                if p not in read and self._readers.get(p, set()) & set(nodes):
+                    emit("X override never read: " + p)
             emit("DONE")
         except BaseException as e:  # noqa: BLE001
             emit(f"X {type(e).__name__}: {e}")
@@ -464,6 +468,8 @@ class Verifier:
             # A setUpClass error fails every test of that class: be conservative.
             log(f"verify: class fixture errors {class_errors[:2]}")
             failed |= set(nodes) - passed
+        if aborted and aborted not in ("stop", "budget"):
+            passed = set()  # the child hit an error: none of its passes can be trusted
         unverified = set(nodes) - failed - passed
         if aborted and aborted != "stop":
             log(f"verify: aborted ({aborted}); {len(unverified)} unverified")
