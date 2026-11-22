@@ -174,11 +174,13 @@ def main(sqlglot_dir, covmap_path, files_by_test_path, out_path, classes_by_test
 
     # ---- fixtures ---------------------------------------------------------
     fixture_tests = defaultdict(set)
+    fixture_readers = defaultdict(set)  # traced reads only (no text matching)
     traced = json.load(open(files_by_test_path))
     for t, fs in traced.items():
         if t in tid:
             for f in fs:
                 fixture_tests[f].add(tid[t])
+                fixture_readers[f].add(tid[t])
     fixtures = []
     for root, _, files in os.walk("tests/fixtures"):
         for fn in files:
@@ -235,6 +237,7 @@ def main(sqlglot_dir, covmap_path, files_by_test_path, out_path, classes_by_test
         "test_spans": test_spans,
         "importers": {k: sorted(v) for k, v in imports.items()},
         "fixture_tests": {k: sorted(v) for k, v in fixture_tests.items()},
+        "fixture_readers": {k: sorted(v) for k, v in fixture_readers.items()},
     }
     json.dump(out, open(out_path, "w"), separators=(",", ":"))
     print(

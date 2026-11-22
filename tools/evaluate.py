@@ -41,7 +41,7 @@ def main(patch_dir, *flags):
                 want |= maps.all
             elif f in tid:
                 want.add(tid[f])
-        got, reasons = sel.select(open(os.path.join(patch_dir, fn)).read())
+        got, reasons, _plan = sel.select(open(os.path.join(patch_dir, fn)).read())
         missed = want - got
         bins, cost = schedule(sorted(got), runtime)
         cost = cost / 1000 + (MISS if missed else 0)

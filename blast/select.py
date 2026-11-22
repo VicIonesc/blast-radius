@@ -197,7 +197,17 @@ class Scopes:
         self.funcs = []  # (start, body_start, end, node)
         self.classes = []  # (start, end, node, qualname)
         self.stmts = []  # (start, end, node)
+        self.func_qual = {}  # id(FunctionDef) -> co_qualname
         self._walk(self.tree, "")
+
+    def outermost_func(self, line):
+        """Outermost function (not nested in another function) containing line."""
+        best = None
+        for f in self.funcs:
+            if f[0] <= line <= f[2] and "<locals>" not in self.func_qual[id(f[3])]:
+                if best is None or f[0] < best[0]:
+                    best = f
+        return best
 
     def _walk(self, node, prefix):
         for child in ast.iter_child_nodes(node):
@@ -205,6 +215,7 @@ class Scopes:
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 start = min([child.lineno] + [d.lineno for d in child.decorator_list])
                 self.funcs.append((start, child.body[0].lineno, child.end_lineno, child))
+                self.func_qual[id(child)] = prefix + child.name
                 qual = f"{prefix}{child.name}.<locals>."
             elif isinstance(child, ast.ClassDef):
                 start = min([child.lineno] + [d.lineno for d in child.decorator_list])
@@ -291,6 +302,15 @@ def patch_words(fp):
     return sorted({w.strip() for w in WORD_RE.findall(text) if len(w.strip()) >= 3})
 
 
+# Huge integration tests and the cheap tests that exercise the same machinery.
+GIANT_PROXIES = {
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds": (
+        "tests/test_executor.py::",
+        "tests/test_optimizer.py::TestOptimizer::test_tpcds",
+        "tests/test_optimizer.py::TestOptimizer::test_optimize",
+    ),
+}
+
 # --------------------------------------------------------------------------- the maps
 
 
@@ -317,7 +337,26 @@ class Maps:
         # Tests that run no measured line (subprocess / static inspection tests).
         self.uncovered = self.all - covered
         self._file_union = {}
+        self.import_ran = {f: set(v) for f, v in c.get("import_ran", {}).items()}
+        self.cpu = {}
+        self.class_setup = {}
+        cpu_path = os.path.join(MAP_DIR, "cpu.json")
+        if os.path.exists(cpu_path):
+            with open(cpu_path) as fh:
+                cj = json.load(fh)
+            tid = {t: i for i, t in enumerate(self.tests)}
+            self.cpu = {tid[t]: v for t, v in cj["test"].items() if t in tid}
+            self.class_setup = cj.get("class_setup", {})
+        self.fixture_readers = {k: set(v) for k, v in m.get("fixture_readers", {}).items()}
         self.traced_classes = set(m.get("traced_classes", []))
+        tid = {t: i for i, t in enumerate(self.tests)}
+        self.giant_proxies = {}
+        for g, prefixes in GIANT_PROXIES.items():
+            if g in tid:
+                self.giant_proxies[tid[g]] = {
+                    i for i, t in enumerate(self.tests)
+                    if t != g and any(t.startswith(p) for p in prefixes)
+                }
         self.class_tests = m.get("class_tests", {})
         self._test_src = {}
 
@@ -401,13 +440,50 @@ class Selector:
         self.m = maps
 
     def select(self, patch_text):
+        """Returns (test ids, reasons, plan). plan is a list of verification steps for
+        blast.verify, or None if this commit can't be verified by hot-patching."""
         reasons = []
         sel = set()
+        self.plan = []
+        self.files = []  # [(path, new text or None)] for fresh-process verification
+        self.touch_sets = []  # candidate set of each changed point (code files)
+        self.direct = set()  # tests the patch edits directly: near-certain failures
         for fp in parse_patch(patch_text):
+            self._step = None  # set by select_file when the file can be hot-patched
+            n_touch = len(self.touch_sets)
             got, why = self.select_file(fp)
+            if len(self.touch_sets) == n_touch:
+                self.touch_sets.append(got)  # fixtures, tests, module-level: one set per file
             sel |= got
             reasons.append(f"{fp.path}:{why}:{len(got)}")
-        return sel, reasons
+            if self.plan is not None:
+                if self._step is None:
+                    self.plan = None
+                else:
+                    self.plan.extend(self._step)
+            if self.files is not None:
+                self.files = self._file_contents(fp, self.files)
+        return sel, reasons, self.plan
+
+    @staticmethod
+    def _file_contents(fp, files):
+        path = fp.path
+        if path is None:
+            return None
+        if not (path.startswith("sqlglot/") or path.startswith("tests/")):
+            return files  # nothing the tests can see
+        if fp.new_path is None:
+            return files + [(fp.old_path, None)]
+        if not fp.hunks:
+            return None if fp.old_path == fp.new_path else None  # binary or bare rename
+        old = old_source(fp.old_path) if fp.old_path else ""
+        new = apply_patch(old if old is not None else "", fp)
+        if new is None:
+            return None
+        out = files + [(fp.new_path, new)]
+        if fp.old_path and fp.old_path != fp.new_path:
+            out.append((fp.old_path, None))
+        return out
 
     def select_file(self, fp: FilePatch):
         m = self.m
@@ -416,14 +492,21 @@ class Selector:
             return set(), "nopath"
 
         if path.startswith("tests/fixtures/"):
-            if fp.old_path is None:
+            if fp.old_path is None or fp.new_path is None:
                 return set(), "new-fixture"
+            old = old_source(path)
+            new = apply_patch(old, fp) if old is not None and fp.hunks else None
+            if new is not None:
+                self._step = [("fixture", path, None, new, None)]
+            # Tests traced reading this exact file will almost surely fail.
+            self.direct |= set(m.fixture_readers.get(path, ()))
             return set(m.meta["fixture_tests"].get(path, [])), "fixture"
 
         is_py = path.endswith(".py")
         in_pkg = path.startswith("sqlglot/")
         in_tests = path.startswith("tests/")
         if not is_py or not (in_pkg or in_tests):
+            self._step = []
             return set(), "non-code"
 
         old = old_source(fp.old_path) if fp.old_path else None
@@ -443,6 +526,7 @@ class Selector:
         except SyntaxError:
             return (self.test_file_all(path) if in_tests else set(m.all)), "syntax-error"
         if code_tokens(old) == code_tokens(new):
+            self._step = []
             return set(), "comment-only"
 
         sc = scopes_for(path)
@@ -451,15 +535,42 @@ class Selector:
 
         sel = set()
         kinds = set()
+        touched = []
         for ln in sorted(fp.changed_old_lines()):
             got, kind = self.for_line(path, sc, ln, ln, fp=fp)
             sel |= got
             kinds.add(kind)
+            touched.append(ln)
+            self.touch_sets.append(got)
         for p, indent in sorted(fp.insert_points().items()):
             got, kind = self.for_line(path, sc, p, p + 1, insertion=True, indent=indent, fp=fp)
             sel |= got
             kinds.add(kind)
+            touched.append(p)
+            self.touch_sets.append(got)
+        if in_tests:
+            order = [path] + sorted(self.m.importer_closure(path) - {path})
+            self._step = [("test", path, None, new, None)] + [
+                ("test", f, None, None, None) for f in order[1:]
+            ]
+        elif kinds <= {"stmt", "block", "func-body"}:
+            self._step = self.code_step(path, sc, old, new, touched)
         return sel, "+".join(sorted(kinds))
+
+    def code_step(self, path, sc, old, new, lines):
+        """Hot-patch plan for changes that sit entirely inside function bodies that did
+        not run at import time. None if that can't be done faithfully."""
+        ran = self.m.import_ran.get(path, set())
+        funcs = set()
+        for ln in lines:
+            f = sc.outermost_func(ln)
+            if f is None or ln < f[1] - 1:
+                return None
+            start, body_start, end, node = f
+            if any(body_start <= x <= end for x in ran):
+                return None  # called while importing: results computed with old code
+            funcs.add(sc.func_qual[id(node)])
+        return [("code", path, old, new, sorted(funcs))]
 
     def test_file_all(self, path):
         out = set()
@@ -516,6 +627,7 @@ class Selector:
             # A test function itself: just that test (its id comes from the span table).
             for a, b, i in m.meta["test_spans"].get(path, []):
                 if a <= lo <= b:
+                    self.direct.add(i)
                     return {i}, "test-body"
         if lo < body_start and not insertion:
             # def line / decorator / signature: anyone who calls it.
@@ -584,8 +696,55 @@ def schedule(nums, runtime):
 # --------------------------------------------------------------------------- main
 
 
+VERIFY = os.environ.get("VERIFY", "1") == "1"
+SLOWDOWN = float(os.environ.get("SLOWDOWN", "1.8"))  # grader CPU vs. the machine cpu.json came from
+BATCH_BUDGET = float(os.environ.get("BATCH_BUDGET", "140"))  # wall seconds for verification
+# Tests we never try to verify in-process: they inspect the process itself.
+NEVER_VERIFY = {
+    "tests/test_generator.py::TestGenerator::test_generator_memory",
+    "tests/dialects/test_dialect.py::TestDialect::test_lazy_load",
+}
+
+
+FORK_CPU = 0.03  # seconds of CPU per verification child beyond the tests themselves
+FRESH_CPU = float(os.environ.get("FRESH_CPU", "0.6"))  # fresh interpreter + imports
+
+
+def choose_verify(maps, ours, never, to_theirs, runtime, overhead=FORK_CPU):
+    """Pick which candidates to run here. Assumes they pass (the common case) and
+    compares: ship the rest unverified vs. the CPU to verify (grader seconds)."""
+    ok = [i for i in ours if i not in never and i in to_theirs and i in maps.cpu]
+    if not ok:
+        return []
+
+    def rec(i):
+        return runtime.get(to_theirs[i], 0) / 1000
+
+    ok.sort(key=lambda i: SLOWDOWN * maps.cpu[i] / max(rec(i), 0.001))
+    rest_all = [to_theirs[i] for i in ours if i in to_theirs]
+    best_cost = schedule(rest_all, runtime)[1] / 1000
+    best_n = 0
+    cuts = set()
+    for thr in (0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0, 1.5, 2.5, 4.0):
+        n = sum(1 for i in ok if SLOWDOWN * maps.cpu[i] / max(rec(i), 0.001) <= thr)
+        cuts.add(n)
+    cuts.add(len(ok))
+    for n in sorted(cuts):
+        if n == 0:
+            continue
+        chosen = set(ok[:n])
+        classes = {maps.tests[i].rsplit("::", 1)[0] for i in chosen}
+        cpu = sum(maps.cpu[i] for i in chosen) + sum(maps.class_setup.get(c, 0) for c in classes)
+        rest = [to_theirs[i] for i in ours if i in to_theirs and i not in chosen]
+        cost = schedule(rest, runtime)[1] / 1000 + SLOWDOWN * (cpu + overhead)
+        if cost < best_cost:
+            best_cost, best_n = cost, n
+    return ok[:best_n]
+
+
 def main():
     t0 = time.process_time()
+    wall0 = time.monotonic()
     maps = Maps()
     sel = Selector(maps)
     tests_json = os.path.join(DATA_DIR, "tests.json")
@@ -596,27 +755,99 @@ def main():
     else:
         to_theirs = {i: i for i in range(len(maps.tests))}
         runtime = {i: int(round(r * 1000)) for i, r in enumerate(maps.runtime)}
+        unknown = []
         log("no tests.json; using our own numbering")
+    # Grader tests with no map entry: include whenever their file is touched by a patch.
+    unknown_by_file = {}
+    for num, f, _ in unknown:
+        unknown_by_file.setdefault(f, []).append(num)
+
+    never = set(maps.uncovered) | {i for i, t in enumerate(maps.tests) if t in NEVER_VERIFY}
+    verifier = None
 
     commit_dir = os.path.join(DATA_DIR, "commits")
+    names = sorted(fn for fn in os.listdir(commit_dir) if fn.endswith(".patch"))
     total = 0
-    for fn in sorted(os.listdir(commit_dir)):
-        if not fn.endswith(".patch"):
-            continue
+    for k, fn in enumerate(names):
         cid = fn[: -len(".patch")]
         with open(os.path.join(commit_dir, fn), encoding="utf-8", errors="replace") as fh:
             text = fh.read()
         try:
-            ours, reasons = sel.select(text)
+            ours, reasons, plan = sel.select(text)
         except Exception as e:  # never crash: fall back to everything
             log(f"{cid}: selector error {e!r}; selecting all")
-            ours, reasons = set(maps.all), ["error"]
-        nums = sorted({to_theirs[i] for i in ours if i in to_theirs})
+            ours, reasons, plan = set(maps.all), ["error"], None
+        extra = set()
+        for f in re.findall(r"^diff --git a/(\S+)", text, re.M):
+            extra.update(unknown_by_file.get(f, []))
+
+        keep = set(ours)
+        note = ""
+        # A giant test may be left to its proxies: cheap tests that run the same
+        # machinery. It's dropped only if every changed point that reaches it also
+        # reaches a proxy we verify, and every such proxy passes.
+        giants = {}
+        for g, proxies in maps.giant_proxies.items():
+            if g in ours:
+                if all(not (g in ts) or (ts & proxies) for ts in sel.touch_sets):
+                    giants[g] = proxies & set(ours)
+        fresh = plan is None and sel.files is not None
+        if VERIFY and (plan is not None or fresh) and ours:
+            pool = set(ours) - set(giants) - sel.direct
+            check = choose_verify(maps, pool, never, to_theirs, runtime,
+                                  FRESH_CPU if fresh else FORK_CPU)
+            must = set().union(*giants.values()) if giants else set()
+            if giants and not must <= set(check):
+                check = sorted(set(check) | (must - never))
+            spent = time.monotonic() - wall0
+            left = BATCH_BUDGET - spent
+            budget = min(30.0, max(0.0, left) / max(1, len(names) - k) * 3)
+            if check and budget >= 1.0:
+                if verifier is None:
+                    from blast.verify import Verifier
+
+                    files = sorted({t.split("::")[0] for t in maps.tests})
+                    verifier = Verifier(SQLGLOT_DIR, files)
+                nodes = [maps.tests[i] for i in check]
+                limits = {
+                    maps.tests[i]: max(3.0, 10 * runtime.get(to_theirs[i], 0) / 1000) for i in check
+                }
+                tc = time.process_time()
+                ru = __import__("resource")
+                c0 = ru.getrusage(ru.RUSAGE_CHILDREN)
+                # A failing proxy means the giant ships anyway, and next to it the rest
+                # packs onto other workers nearly free: stop verifying right there.
+                stop_on = frozenset(maps.tests[i] for i in must)
+                if fresh:
+                    failed, unverified = verifier.run_fresh(sel.files, nodes, limits, budget, stop_on)
+                else:
+                    failed, unverified = verifier.run(plan, nodes, limits, budget, stop_on)
+                    if verifier.last_apply_error and sel.files is not None:
+                        fresh = True  # hot patch didn't apply: redo it from a shadow tree
+                        failed, unverified = verifier.run_fresh(
+                            sel.files, nodes, limits, budget, stop_on)
+                c1 = ru.getrusage(ru.RUSAGE_CHILDREN)
+                child_cpu = (c1.ru_utime + c1.ru_stime) - (c0.ru_utime + c0.ru_stime)
+                bad = failed | unverified
+                keep = (set(ours) - set(check)) | {i for i in check if maps.tests[i] in bad}
+                dropped = []
+                for g, proxies in giants.items():
+                    if proxies and not any(maps.tests[i] in bad for i in proxies):
+                        keep.discard(g)
+                        dropped.append(maps.tests[g].split("::")[-1])
+                note = (f" {'fresh' if fresh else 'fork'}-verified {len(check)}: {len(failed)} fail,"
+                        f" {len(unverified)} undecided, child cpu {child_cpu:.2f}s"
+                        + (f" dropped {dropped}" if dropped else ""))
+        nums = sorted({to_theirs[i] for i in keep if i in to_theirs} | extra)
         bins, cost = schedule(nums, runtime)
         total += cost
         print(json.dumps({"commit": cid, "workers": bins}, separators=(",", ":")), flush=True)
-        log(f"{cid}: {len(nums)} tests, est {cost / 1000:.1f}s  [{'; '.join(reasons)}]")
-    log(f"estimated test cost {total / 1000:.1f}s, cpu {time.process_time() - t0:.2f}s")
+        log(f"{cid}: {len(ours)} cand -> {len(nums)} tests, est {cost / 1000:.1f}s"
+            f"{note}  [{'; '.join(reasons)}]")
+    ru = __import__("resource")
+    child = ru.getrusage(ru.RUSAGE_CHILDREN)
+    log(f"estimated test cost {total / 1000:.1f}s, cpu self {time.process_time() - t0:.2f}s"
+        f" + children {child.ru_utime + child.ru_stime:.2f}s, wall {time.monotonic() - wall0:.1f}s")
 
 
 if __name__ == "__main__":

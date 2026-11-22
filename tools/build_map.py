@@ -51,16 +51,29 @@ def main(cov_path, junit_path, out_path):
     if missing:
         print(f"warning: {len(missing)} tests without junit time, e.g. {missing[:3]}", file=sys.stderr)
 
+    class_members = {}
+    for t, i in tid.items():
+        class_members.setdefault(t.rsplit("::", 1)[0], set()).add(i)
+
     set_index = {}
     sets = []
     files = {}
     import_only = {}
+    import_ran = {}  # every line that ran outside a test (import / collection time)
     for f in sorted(data.measured_files()):
         by_line = data.contexts_by_lineno(f)
         lines = {}
         imp = []
+        at_import = []
         for line, ctxs in sorted(by_line.items()):
-            ids = tuple(sorted(tid[c[:-4]] for c in ctxs if c.endswith("|run") and c[:-4] in tid))
+            if "" in ctxs:
+                at_import.append(line)
+            ids = set(tid[c[:-4]] for c in ctxs if c.endswith("|run") and c[:-4] in tid)
+            for c in ctxs:
+                # setUpClass / class teardown: every test in that class depends on it.
+                if c.endswith(("|setup", "|teardown")):
+                    ids |= class_members.get(c.rsplit("|", 1)[0].rsplit("::", 1)[0], set())
+            ids = tuple(sorted(ids))
             if not ids:
                 imp.append(line)
                 continue
@@ -70,10 +83,13 @@ def main(cov_path, junit_path, out_path):
                 sets.append(list(ids))
             lines[line] = k
         files[f] = lines
+        if at_import:
+            import_ran[f] = at_import
         if imp:
             import_only[f] = imp
 
-    out = {"tests": tests, "runtime": runtime, "sets": sets, "files": files, "import": import_only}
+    out = {"tests": tests, "runtime": runtime, "sets": sets, "files": files,
+           "import": import_only, "import_ran": import_ran}
     with open(out_path, "w") as fh:
         json.dump(out, fh, separators=(",", ":"))
     print(f"{len(tests)} tests, {len(files)} files, {len(sets)} unique sets", file=sys.stderr)
