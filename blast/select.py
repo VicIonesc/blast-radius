@@ -171,7 +171,7 @@ def old_source(path):
         try:
             with open(p, encoding="utf-8") as fh:
                 _src_cache[path] = fh.read()
-        except OSError:
+        except (OSError, UnicodeDecodeError):  # missing or binary
             _src_cache[path] = None
     return _src_cache[path]
 
@@ -475,7 +475,11 @@ class Selector:
         if fp.new_path is None:
             return files + [(fp.old_path, None)]
         if not fp.hunks:
-            return None if fp.old_path == fp.new_path else None  # binary or bare rename
+            if fp.old_path and fp.old_path != fp.new_path and path.endswith(".py"):
+                old = old_source(fp.old_path)  # bare rename: same text, new place
+                if old is not None:
+                    return files + [(fp.new_path, old), (fp.old_path, None)]
+            return None  # binary, or nothing we can reproduce
         old = old_source(fp.old_path) if fp.old_path else ""
         new = apply_patch(old if old is not None else "", fp)
         if new is None:
@@ -492,8 +496,11 @@ class Selector:
             return set(), "nopath"
 
         if path.startswith("tests/fixtures/"):
-            if fp.old_path is None or fp.new_path is None:
+            if fp.old_path is None:
                 return set(), "new-fixture"
+            if fp.new_path is None or fp.old_path != fp.new_path or not fp.hunks:
+                # Deleted, moved or binary: whoever reads it is affected; can't verify.
+                return set(m.meta["fixture_tests"].get(fp.old_path, [])), "fixture-moved"
             old = old_source(path)
             new = apply_patch(old, fp) if old is not None and fp.hunks else None
             if new is not None:
@@ -511,7 +518,8 @@ class Selector:
             return set(), "non-code"
 
         old = old_source(fp.old_path) if fp.old_path else None
-        if fp.new_path is None:  # deleted file
+        if fp.new_path is None or (fp.old_path and fp.old_path != fp.new_path):
+            # Deleted or moved: everything importing the old path breaks.
             if in_tests:
                 return self.test_file_all(path), "deleted-test-file"
             return set(m.all), "deleted-module"
@@ -765,6 +773,63 @@ def choose_verify(maps, ours, never, to_theirs, runtime, overhead=FORK_CPU):
     return ok[:best_n]
 
 
+def verify_commit(maps, sel, state, ours, plan, to_theirs, runtime, never, wall0, k, n_commits):
+    """Run the candidates worth running here; returns (tests to ship, log note)."""
+    keep = set(ours)
+    fresh = plan is None and sel.files is not None
+    if not (VERIFY and (plan is not None or fresh) and ours):
+        return keep, ""
+    # A giant test may be left to its proxies: cheap tests that run the same
+    # machinery. It's dropped only if every changed point that reaches it also
+    # reaches a proxy we verify, and every such proxy passes.
+    giants = {}
+    for g, proxies in maps.giant_proxies.items():
+        if g in ours and all(not (g in ts) or (ts & proxies) for ts in sel.touch_sets):
+            giants[g] = (proxies & set(ours)) - never
+    pool = set(ours) - set(giants) - sel.direct
+    check = choose_verify(maps, pool, never, to_theirs, runtime, FRESH_CPU if fresh else FORK_CPU)
+    must = set().union(*giants.values()) if giants else set()
+    if must - set(check):
+        check = sorted(set(check) | must)
+    left = BATCH_BUDGET - (time.monotonic() - wall0)
+    budget = min(30.0, max(0.0, left) / max(1, n_commits - k) * 3)
+    if not check or budget < 1.0:
+        return keep, ""
+    if "verifier" not in state:
+        from blast.verify import Verifier
+
+        state["verifier"] = Verifier(SQLGLOT_DIR, sorted({t.split("::")[0] for t in maps.tests}))
+    verifier = state["verifier"]
+    nodes = [maps.tests[i] for i in check]
+    limits = {maps.tests[i]: max(3.0, 10 * runtime.get(to_theirs[i], 0) / 1000) for i in check}
+    import resource as ru
+
+    c0 = ru.getrusage(ru.RUSAGE_CHILDREN)
+    # A failing proxy means the giant ships anyway, and next to it the rest packs onto
+    # other workers nearly free: stop verifying right there.
+    stop_on = frozenset(maps.tests[i] for i in must)
+    if fresh:
+        failed, unverified = verifier.run_fresh(sel.files, nodes, limits, budget, stop_on)
+    else:
+        failed, unverified = verifier.run(plan, nodes, limits, budget, stop_on)
+        if verifier.last_apply_error and sel.files is not None:
+            fresh = True  # hot patch didn't apply: redo it from a shadow tree
+            failed, unverified = verifier.run_fresh(sel.files, nodes, limits, budget, stop_on)
+    c1 = ru.getrusage(ru.RUSAGE_CHILDREN)
+    child_cpu = (c1.ru_utime + c1.ru_stime) - (c0.ru_utime + c0.ru_stime)
+    bad = failed | unverified
+    keep = (set(ours) - set(check)) | {i for i in check if maps.tests[i] in bad}
+    dropped = []
+    for g, proxies in giants.items():
+        if proxies and not any(maps.tests[i] in bad for i in proxies):
+            keep.discard(g)
+            dropped.append(maps.tests[g].split("::")[-1])
+    note = (f" {'fresh' if fresh else 'fork'}-verified {len(check)}: {len(failed)} fail,"
+            f" {len(unverified)} undecided, child cpu {child_cpu:.2f}s"
+            + (f" dropped {dropped}" if dropped else ""))
+    return keep, note
+
+
 def main():
     t0 = time.process_time()
     wall0 = time.monotonic()
@@ -786,7 +851,7 @@ def main():
         unknown_by_file.setdefault(f, []).append(num)
 
     never = set(maps.uncovered) | {i for i, t in enumerate(maps.tests) if t in NEVER_VERIFY}
-    verifier = None
+    state = {}  # holds the Verifier once one is needed
 
     commit_dir = os.path.join(DATA_DIR, "commits")
     names = sorted(fn for fn in os.listdir(commit_dir) if fn.endswith(".patch"))
@@ -797,70 +862,23 @@ def main():
             text = fh.read()
         try:
             ours, reasons, plan = sel.select(text)
-        except Exception as e:  # never crash: fall back to everything
+        except Exception as e:  # never crash: fall back to everything, unverified
             log(f"{cid}: selector error {e!r}; selecting all")
             ours, reasons, plan = set(maps.all), ["error"], None
+            sel.files = None
         extra = set()
-        for f in re.findall(r"^diff --git a/(\S+)", text, re.M):
-            extra.update(unknown_by_file.get(f, []))
+        for f in re.findall(r"^diff --git a/(\S+) b/(\S+)", text, re.M):
+            for p in f:
+                extra.update(unknown_by_file.get(p, []))
+                if p.startswith("sqlglotc/"):  # tests/test_sqlglotc.py loads sqlglotc/setup.py
+                    extra.update(unknown_by_file.get("tests/test_sqlglotc.py", []))
 
-        keep = set(ours)
-        note = ""
-        # A giant test may be left to its proxies: cheap tests that run the same
-        # machinery. It's dropped only if every changed point that reaches it also
-        # reaches a proxy we verify, and every such proxy passes.
-        giants = {}
-        for g, proxies in maps.giant_proxies.items():
-            if g in ours:
-                if all(not (g in ts) or (ts & proxies) for ts in sel.touch_sets):
-                    giants[g] = proxies & set(ours)
-        fresh = plan is None and sel.files is not None
-        if VERIFY and (plan is not None or fresh) and ours:
-            pool = set(ours) - set(giants) - sel.direct
-            check = choose_verify(maps, pool, never, to_theirs, runtime,
-                                  FRESH_CPU if fresh else FORK_CPU)
-            must = set().union(*giants.values()) if giants else set()
-            if giants and not must <= set(check):
-                check = sorted(set(check) | (must - never))
-            spent = time.monotonic() - wall0
-            left = BATCH_BUDGET - spent
-            budget = min(30.0, max(0.0, left) / max(1, len(names) - k) * 3)
-            if check and budget >= 1.0:
-                if verifier is None:
-                    from blast.verify import Verifier
-
-                    files = sorted({t.split("::")[0] for t in maps.tests})
-                    verifier = Verifier(SQLGLOT_DIR, files)
-                nodes = [maps.tests[i] for i in check]
-                limits = {
-                    maps.tests[i]: max(3.0, 10 * runtime.get(to_theirs[i], 0) / 1000) for i in check
-                }
-                tc = time.process_time()
-                ru = __import__("resource")
-                c0 = ru.getrusage(ru.RUSAGE_CHILDREN)
-                # A failing proxy means the giant ships anyway, and next to it the rest
-                # packs onto other workers nearly free: stop verifying right there.
-                stop_on = frozenset(maps.tests[i] for i in must)
-                if fresh:
-                    failed, unverified = verifier.run_fresh(sel.files, nodes, limits, budget, stop_on)
-                else:
-                    failed, unverified = verifier.run(plan, nodes, limits, budget, stop_on)
-                    if verifier.last_apply_error and sel.files is not None:
-                        fresh = True  # hot patch didn't apply: redo it from a shadow tree
-                        failed, unverified = verifier.run_fresh(
-                            sel.files, nodes, limits, budget, stop_on)
-                c1 = ru.getrusage(ru.RUSAGE_CHILDREN)
-                child_cpu = (c1.ru_utime + c1.ru_stime) - (c0.ru_utime + c0.ru_stime)
-                bad = failed | unverified
-                keep = (set(ours) - set(check)) | {i for i in check if maps.tests[i] in bad}
-                dropped = []
-                for g, proxies in giants.items():
-                    if proxies and not any(maps.tests[i] in bad for i in proxies):
-                        keep.discard(g)
-                        dropped.append(maps.tests[g].split("::")[-1])
-                note = (f" {'fresh' if fresh else 'fork'}-verified {len(check)}: {len(failed)} fail,"
-                        f" {len(unverified)} undecided, child cpu {child_cpu:.2f}s"
-                        + (f" dropped {dropped}" if dropped else ""))
+        try:
+            keep, note = verify_commit(maps, sel, state, ours, plan, to_theirs, runtime,
+                                       never, wall0, k, len(names))
+        except Exception as e:  # verification is an optimization: never let it crash a run
+            log(f"{cid}: verification error {e!r}; keeping all candidates")
+            keep, note = set(ours), " verify-error"
         nums = sorted({to_theirs[i] for i in keep if i in to_theirs} | extra)
         bins, cost = schedule(nums, runtime)
         total += cost
