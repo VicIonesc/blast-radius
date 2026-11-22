@@ -66,7 +66,70 @@ def traced_class_keys():
     return sorted(keys)
 
 
-def main(sqlglot_dir, covmap_path, files_by_test_path, out_path, classes_by_test_path=None):
+def import_read_attrs(sqlglot_dir):
+    """UPPERCASE attribute names referenced where the dynamic import trace can't see:
+    module and class bodies (outside functions and lambdas), and the class-creation hooks
+    (methods of metaclasses, __init_subclass__), which read a class while its own module
+    is still loading."""
+    names = set()
+    is_attr = re.compile(r"^_?[A-Z][A-Z0-9_]*$")
+
+    def collect(tree_node):
+        for n in ast.walk(tree_node):
+            if isinstance(n, ast.Attribute) and is_attr.match(n.attr):
+                names.add(n.attr)
+            elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and is_attr.match(n.id):
+                names.add(n.id)
+            elif isinstance(n, ast.Constant) and isinstance(n.value, str) and is_attr.match(n.value):
+                names.add(n.value)
+
+    def visit(node, in_metaclass):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for d in child.decorator_list + child.args.defaults:
+                    collect(d)
+                if in_metaclass or child.name == "__init_subclass__":
+                    collect(child)
+                continue
+            if isinstance(child, ast.Lambda):
+                continue
+            if isinstance(child, ast.ClassDef):
+                meta = any(isinstance(b, ast.Name) and b.id == "type" for b in child.bases)
+                for b in child.bases + child.decorator_list + [k.value for k in child.keywords]:
+                    collect(b)
+                visit(child, meta)
+                continue
+            if isinstance(child, ast.stmt):
+                # module/class level statement: everything but nested defs/lambdas
+                for n in ast.iter_child_nodes(child):
+                    if not isinstance(n, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        visit_expr(n)
+                if isinstance(child, (ast.If, ast.Try, ast.With, ast.For)):
+                    visit(child, in_metaclass)
+            else:
+                visit_expr(child)
+
+    def visit_expr(n):
+        if isinstance(n, ast.Lambda):
+            for d in n.args.defaults:
+                collect(d)
+            return
+        if isinstance(n, (ast.Attribute, ast.Name, ast.Constant)):
+            collect(n)
+        for c in ast.iter_child_nodes(n):
+            if not isinstance(c, ast.stmt):
+                visit_expr(c)
+
+    for dirpath, _, files in os.walk(os.path.join(sqlglot_dir, "sqlglot")):
+        for fn in files:
+            if fn.endswith(".py"):
+                path = os.path.join(dirpath, fn)
+                visit(ast.parse(open(path, encoding="utf-8").read()), False)
+    return names
+
+
+def main(sqlglot_dir, covmap_path, files_by_test_path, out_path, classes_by_test_path=None,
+         attrs_by_test_path=None):
     sys.path.insert(0, sqlglot_dir)
     os.chdir(sqlglot_dir)
     m = json.load(open(covmap_path))
@@ -234,7 +297,65 @@ def main(sqlglot_dir, covmap_path, files_by_test_path, out_path, classes_by_test
                     class_tests[n].add(tid[t])
     traced = traced_class_keys()
 
+    # ---- class attribute reads -------------------------------------------
+    attr_tests = defaultdict(set)
+    if attrs_by_test_path and os.path.exists(attrs_by_test_path):
+        for t, keys in json.load(open(attrs_by_test_path)).items():
+            if t in tid:
+                for k in keys:
+                    attr_tests[k].add(tid[t])
+    from sqlglot.dialects.dialect import Dialect as _D
+    from sqlglot.generator import Generator as _G
+    from sqlglot.parser import Parser as _P
+    from sqlglot.tokens import Tokenizer as _T
+
+    def key_of(c):
+        mod = sys.modules.get(c.__module__)
+        f = getattr(mod, "__file__", "") or ""
+        i = f.rfind("/sqlglot/")
+        return f"{f[i + 1:]}:{c.__qualname__}" if i >= 0 else None
+
+    attr_subclasses = {}
+    allc, todo = set(), [_D, _P, _G, _T]
+    while todo:
+        c = todo.pop()
+        if c not in allc:
+            allc.add(c)
+            todo.extend(c.__subclasses__())
+    for c in allc:
+        k = key_of(c)
+        if not k:
+            continue
+        sub, stack = set(), [c]
+        while stack:
+            x = stack.pop()
+            kx = key_of(x)
+            if kx and kx not in sub:
+                sub.add(kx)
+                stack.extend(x.__subclasses__())
+        attr_subclasses[k] = sorted(sub)
+    attr_own, attr_mro = {}, {}
+    setting = re.compile(r"^_?[A-Z][A-Z0-9_]*$")
+    for c in allc:
+        k = key_of(c)
+        if not k:
+            continue
+        attr_own[k] = sorted(n for n in vars(c) if setting.match(n) and not n.startswith("__"))
+        attr_mro[k] = [kk for kk in (key_of(b) for b in c.__mro__) if kk]
+    imp_attrs = sorted(import_read_attrs(sqlglot_dir))
+    ir_path = os.path.join(os.path.dirname(attrs_by_test_path or covmap_path), "import_reads.json")
+    import_reads = json.load(open(ir_path)) if os.path.exists(ir_path) else []
+    collect_reads = sorted(json.load(open(attrs_by_test_path)).get("COLLECT", [])) if (
+        attrs_by_test_path and os.path.exists(attrs_by_test_path)) else []
+
     out = {
+        "attr_tests": {k: sorted(v) for k, v in attr_tests.items()},
+        "attr_subclasses": attr_subclasses,
+        "attr_own": attr_own,
+        "attr_mro": attr_mro,
+        "import_read_attrs": imp_attrs,
+        "collect_reads": collect_reads,
+        "import_reads": import_reads,
         "traced_classes": traced,
         "class_tests": {k: sorted(v) for k, v in class_tests.items()},
         "dialect_files": dialect_files,
@@ -255,4 +376,4 @@ def main(sqlglot_dir, covmap_path, files_by_test_path, out_path, classes_by_test
 
 
 if __name__ == "__main__":
-    main(*[os.path.abspath(a) for a in sys.argv[1:6]])
+    main(*[os.path.abspath(a) for a in sys.argv[1:7]])

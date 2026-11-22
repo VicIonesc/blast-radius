@@ -22,7 +22,7 @@ from blast.select import GIANT_PROXIES, Maps, Selector  # noqa: E402
 from tools.mutate import CMP_SWAP, unified  # noqa: E402
 from tools.truth import failing  # noqa: E402
 
-GIANT = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+GIANT = os.environ.get("BR_GIANT", "tests/test_executor.py::TestExecutor::test_execute_tpcds")
 
 
 def mutants(sqlglot_dir, maps, count, seed):

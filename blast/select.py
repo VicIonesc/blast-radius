@@ -310,6 +310,12 @@ GIANT_PROXIES = {
         "tests/test_optimizer.py::TestOptimizer::test_optimize",
     ),
 }
+if os.environ.get("BR_MAXNODES_PROXIES") == "1":  # under evaluation
+    GIANT_PROXIES["tests/test_parser.py::TestParser::test_max_nodes"] = (
+        "tests/test_parser.py::",
+        "tests/test_transpile.py::",
+        "tests/test_expressions.py::",
+    )
 
 # --------------------------------------------------------------------------- the maps
 
@@ -351,6 +357,13 @@ class Maps:
             self.class_setup = cj.get("class_setup", {})
         self.fixture_readers = {k: set(v) for k, v in m.get("fixture_readers", {}).items()}
         self.traced_classes = set(m.get("traced_classes", []))
+        self.attr_tests = {k: set(v) for k, v in m.get("attr_tests", {}).items()}
+        self.attr_subclasses = m.get("attr_subclasses", {})
+        self.attr_own = m.get("attr_own", {})
+        self.attr_mro = m.get("attr_mro", {})
+        self.import_read_attrs = set(m.get("import_read_attrs", []))
+        self.import_reads = set(m.get("import_reads", []))
+        self.collect_reads = set(m.get("collect_reads", []))
         tid = {t: i for i, t in enumerate(self.tests)}
         self.giant_proxies = {}
         for g, prefixes in GIANT_PROXIES.items():
@@ -437,9 +450,13 @@ class Maps:
 # --------------------------------------------------------------------------- selection
 
 
+SETTING_RE = re.compile(r"^_?[A-Z][A-Z0-9_]*$")
+
+
 class Selector:
     def __init__(self, maps: Maps):
         self.m = maps
+        self._new_trees = {}
 
     def select(self, patch_text):
         """Returns (test ids, reasons, plan). plan is a list of verification steps for
@@ -450,6 +467,7 @@ class Selector:
         self.files = []  # [(path, new text or None)] for fresh-process verification
         self.touch_sets = []  # candidate set of each changed point (code files)
         self.direct = set()  # tests the patch edits directly: near-certain failures
+        self._new_trees = {}
         for fp in parse_patch(patch_text):
             self._step = None  # set by select_file when the file can be hot-patched
             n_touch = len(self.touch_sets)
@@ -589,6 +607,67 @@ class Selector:
             out |= self.m.test_files.get(f, set())
         return out
 
+    def settings_change(self, path, c, fp):
+        """If the only change to class c is to UPPERCASE settings that are read at runtime
+        only (never while classes are being built), return the tests that read those
+        settings on c or a subclass. Otherwise None."""
+        m = self.m
+        key = f"{path}:{c[3]}"
+        subtree = m.attr_subclasses.get(key)
+        if not subtree or fp is None:
+            return None
+        if path not in self._new_trees:
+            new = apply_patch(old_source(path), fp)
+            try:
+                self._new_trees[path] = Scopes(new) if new is not None else None
+            except SyntaxError:
+                self._new_trees[path] = None
+        new_sc = self._new_trees[path]
+        if new_sc is None:
+            return None
+        new_cls = [x for x in new_sc.classes if x[3] == c[3]]
+        if len(new_cls) != 1:
+            return None
+
+        def parts(node):
+            settings, other = {}, []
+            for st in node.body:
+                target = None
+                if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
+                    target = st.targets[0].id
+                elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) and st.value is not None:
+                    target = st.target.id
+                if target is not None and SETTING_RE.match(target):
+                    settings[target] = ast.dump(st.value)
+                elif isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    other.append(("def", st.name))  # bodies are scoped separately
+                elif isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant):
+                    continue  # docstring
+                else:
+                    other.append(("stmt", ast.dump(st)))
+            return settings, sorted(other)
+
+        old_set, old_other = parts(c[2])
+        new_set, new_other = parts(new_cls[0][2])
+        if old_other != new_other:
+            return None
+        changed = {n for n in set(old_set) | set(new_set) if old_set.get(n) != new_set.get(n)}
+        if not changed:
+            return None
+        inherited = set()
+        for k in m.attr_mro.get(key, ()):
+            inherited.update(m.attr_own.get(k, ()))
+        got = set()
+        for a in changed:
+            if a in m.import_read_attrs or a not in inherited:
+                return None  # baked in at import, or a brand-new name (getattr defaults)
+            for s in subtree:
+                k = f"{s}.{a}"
+                if k in m.import_reads or k in m.collect_reads:
+                    return None
+                got |= m.attr_tests.get(k, set())
+        return got
+
     def module_level(self, path, sc=None, line=None, fp=None):
         """A change outside any function body: it runs at import or class creation."""
         m = self.m
@@ -597,6 +676,9 @@ class Selector:
         c = sc.innermost_class(line) if sc is not None and line is not None else None
         if c is not None:
             key = f"{path}:{c[3]}"
+            narrowed = self.settings_change(path, c, fp)
+            if narrowed is not None:
+                return narrowed, "class-setting"
             if key in m.traced_classes:
                 # Class attributes of an expression/parser/generator/tokenizer class only
                 # matter to tests that build an instance of it (or of a subclass). Names

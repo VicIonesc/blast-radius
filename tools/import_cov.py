@@ -23,7 +23,7 @@ def main(sqlglot_dir, covmap):
     import pkgutil
 
     import sqlglot
-    from sqlglot.dialects.dialect import Dialect, Dialects
+    from sqlglot.dialects.dialect import Dialect
 
     for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
         if info.name != "sqlglot.__main__":
@@ -31,12 +31,21 @@ def main(sqlglot_dir, covmap):
                 importlib.import_module(info.name)
             except Exception:
                 pass
-    for d in Dialects:
-        if d.value:
+    for d in list(Dialect.classes):
+        if d:
             try:
-                Dialect.get_or_raise(d.value)
+                Dialect.get_or_raise(d)
             except Exception:
                 pass
+    # Snapshot: what sqlglot itself runs while loading (before any test module).
+    cov.stop()
+    own = {}
+    d0 = cov.get_data()
+    for f in d0.measured_files():
+        rel = os.path.relpath(f, sqlglot_dir).replace(os.sep, "/")
+        if rel.startswith("sqlglot/"):
+            own[rel] = sorted(d0.lines(f) or [])
+    cov.start()
     for root, _, files in os.walk("tests"):
         for fn in files:
             if fn.endswith(".py") and "fixtures" not in root:
@@ -55,6 +64,7 @@ def main(sqlglot_dir, covmap):
             ran[rel] = lines
     c = json.load(open(covmap))
     c["import_ran"] = ran
+    c["sqlglot_import_ran"] = own
     json.dump(c, open(covmap, "w"), separators=(",", ":"))
     print(f"import-time lines: {sum(len(v) for v in ran.values())} in {len(ran)} files", file=sys.stderr)
 

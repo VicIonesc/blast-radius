@@ -7,7 +7,7 @@ SQLGLOT="$(cd "${1:-$ROOT/vendor/sqlglot}" && pwd)"
 PY="${2:-$ROOT/.venv/bin/python}"
 BUILD="$ROOT/build"
 mkdir -p "$BUILD" "$ROOT/map"
-rm -f "$BUILD"/.coverage* "$BUILD"/files.*.json "$BUILD"/classes.*.json
+rm -f "$BUILD"/.coverage* "$BUILD"/files.*.json "$BUILD"/classes.*.json "$BUILD"/attrs.*.json
 
 cat > "$BUILD/coveragerc" <<EOF
 [run]
@@ -31,16 +31,26 @@ echo "2/3 timing run" >&2
 echo "3/3 file-read + class trace run" >&2
 PYTHONPATH="$ROOT" TRACE_FILES_OUT="$BUILD/files" TRACE_CLASSES_OUT="$BUILD/classes" \
   "$PY" -m pytest "${COMMON[@]}" -p tools.inline_pools_plugin -p tools.trace_files_plugin -p tools.trace_classes_plugin | tail -1 || true
+echo "4/4 class attribute read trace" >&2
+PYTHONPATH="$ROOT" TRACE_ATTRS_OUT="$BUILD/attrs" \
+  "$PY" -m pytest "${COMMON[@]}" -p tools.inline_pools_plugin -p tools.trace_attrs_plugin | tail -1 || true
 "$PY" - "$BUILD" <<'EOF'
 import glob, json, sys
 b = sys.argv[1]
-for kind in ("files", "classes"):
+for kind in ("files", "classes", "attrs"):
     m = {}
+    collect = set()
     for f in glob.glob(f"{b}/{kind}.*.json"):
-        m.update(json.load(open(f)))
+        part = json.load(open(f))
+        collect.update(part.pop("COLLECT", []))
+        m.update(part)
+    if kind == "attrs":
+        m["COLLECT"] = sorted(collect)
     json.dump(m, open(f"{b}/{kind}_by_test.json", "w"))
 EOF
 
 cd "$ROOT"
 "$PY" tools/build_map.py "$BUILD/.coverage" "$BUILD/junit.xml" map/covmap.json
-"$PY" tools/build_meta.py "$SQLGLOT" map/covmap.json "$BUILD/files_by_test.json" map/meta.json "$BUILD/classes_by_test.json"
+"$PY" tools/import_cov.py "$SQLGLOT" map/covmap.json
+"$PY" tools/import_reads.py "$SQLGLOT" "$BUILD/import_reads.json"
+"$PY" tools/build_meta.py "$SQLGLOT" map/covmap.json "$BUILD/files_by_test.json" map/meta.json "$BUILD/classes_by_test.json" "$BUILD/attrs_by_test.json"
