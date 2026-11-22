@@ -452,12 +452,18 @@ class Maps:
 
 
 SETTING_RE = re.compile(r"^_?[A-Z][A-Z0-9_]*$")
+# Only worth a patched import (about 1 s of CPU) when the fallback is this big.
+DIFF_MIN_RUNTIME = 6.0
 
 
 class Selector:
     def __init__(self, maps: Maps):
         self.m = maps
         self._new_trees = {}
+        self._new_text = {}
+        # (path, new source) -> changed keys after a full patched import, or None
+        # (blast.verify.Verifier.import_diff); unset = never diff.
+        self.diff_fn = None
 
     def select(self, patch_text):
         """Returns (test ids, reasons, plan). plan is a list of verification steps for
@@ -619,6 +625,7 @@ class Selector:
             return None
         if path not in self._new_trees:
             new = apply_patch(old_source(path), fp)
+            self._new_text[path] = new
             try:
                 self._new_trees[path] = Scopes(new) if new is not None else None
             except SyntaxError:
@@ -659,14 +666,50 @@ class Selector:
         for k in m.attr_mro.get(key, ()):
             inherited.update(m.attr_own.get(k, ()))
         got = set()
+        baked = False
         for a in changed:
-            if a in m.import_read_attrs or a not in inherited:
-                return None  # baked in at import, or a brand-new name (getattr defaults)
+            if a not in inherited:
+                return None  # a brand-new name (getattr defaults)
+            baked |= a in m.import_read_attrs
             for s in subtree:
                 k = f"{s}.{a}"
-                if k in m.import_reads or k in m.collect_reads:
-                    return None
+                baked |= k in m.import_reads or k in m.collect_reads
                 got |= m.attr_tests.get(k, set())
+        if not baked:
+            return got
+        # Read while things were being built: see what that bakes in differently.
+        fallback = set(m.class_tests.get(key, ())) or m.all
+        if self.diff_fn is None or sum(m.runtime[i] for i in fallback) < DIFF_MIN_RUNTIME:
+            return None
+        keys = self.diff_fn(path, self._new_text.get(path))
+        if keys is None:
+            return None
+        more = self.tests_for_world_diff(keys)
+        if more is None:
+            return None
+        return got | more
+
+    def tests_for_world_diff(self, keys):
+        """Tests that can observe a change to these loaded values (blast.worlddiff keys),
+        or None if one of them isn't something we trace."""
+        m = self.m
+        got = set()
+        for k in keys:
+            if "::" in k:
+                f = k.split("::", 1)[0]
+                if not f.startswith("tests/"):
+                    return None  # a module global of sqlglot
+                got |= self.test_file_all(f)
+                continue
+            owner, _, name = k.rpartition(".")
+            f = owner.split(":", 1)[0]
+            if f.startswith("tests/"):
+                got |= self.test_file_all(f)
+            elif owner in m.attr_subclasses and SETTING_RE.match(name):
+                for s in m.attr_subclasses[owner]:
+                    got |= m.attr_tests.get(f"{s}.{name}", set())
+            else:
+                return None
         return got
 
     def module_level(self, path, sc=None, line=None, fp=None):
@@ -952,6 +995,17 @@ def main():
             from blast.verify import Verifier, bench
 
             state["verifier"] = Verifier(SQLGLOT_DIR, sorted({t.split("::")[0] for t in maps.tests}))
+            if state["verifier"].ok:
+                def diff_fn(path, new_text, _v=state["verifier"]):
+                    if new_text is None:
+                        return None
+                    try:
+                        return _v.import_diff([(path, new_text)])
+                    except Exception as e:  # noqa: BLE001
+                        log(f"import diff failed: {e!r}")
+                        return None
+
+                sel.diff_fn = diff_fn
             if SLOWDOWN_SETTING == "auto" and maps.bench_ref and state["verifier"].ok:
                 global SLOWDOWN
                 here = bench()

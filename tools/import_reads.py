@@ -56,6 +56,8 @@ class Hook(importlib.abc.MetaPathFinder):
                 def exec_module(module, _orig=orig):
                     _orig(module)
                     _install_on_module(module)
+                    if module.__name__ == "sqlglot.tokens":
+                        T.install_core_tracing()
 
                 spec.loader.exec_module = exec_module
                 return spec

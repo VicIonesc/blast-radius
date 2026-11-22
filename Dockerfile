@@ -24,6 +24,6 @@ RUN python -m compileall -q /app/blast && chmod -R a+rX /app
 ENV SQLGLOT_DIR=/opt/sqlglot \
     MAP_DIR=/app/map \
     DATA_DIR=/data \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 PYTHONHASHSEED=0
 
 CMD ["python", "-m", "blast.select"]

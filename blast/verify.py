@@ -252,33 +252,15 @@ class Verifier:
         if sqlglot_dir not in sys.path:
             sys.path.insert(0, sqlglot_dir)
         try:
-            import pkgutil
-
-            import sqlglot
-            from sqlglot.dialects.dialect import Dialect, Dialects
+            from blast.worlddiff import load_world
 
             # Load every module now: one imported lazily in the child would come from
             # disk unpatched, and its functions would be missing from the index.
-            for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
-                if info.name != "sqlglot.__main__":
-                    try:
-                        importlib.import_module(info.name)
-                    except Exception:
-                        pass
-
-            for d in Dialects:
-                if d.value:
-                    try:
-                        Dialect.get_or_raise(d.value)
-                    except Exception:
-                        pass
-            self.modules = {}
+            self.modules_files = list(test_files)
+            self.modules = load_world(sqlglot_dir, test_files)
             for f in sorted(test_files):
-                name = f[:-3].replace("/", ".")
-                try:
-                    self.modules[f] = importlib.import_module(name)
-                except Exception as e:  # import error: those tests are verified by fallback
-                    log(f"verify: cannot import {name}: {e!r}")
+                if f not in self.modules:  # import error: verified by fallback
+                    log(f"verify: cannot import {f}")
             # Index every live sqlglot function by where its code came from.
             roots = {sqlglot_dir + os.sep, os.path.realpath(sqlglot_dir) + os.sep}
             self.funcs = {}
@@ -415,18 +397,12 @@ class Verifier:
         os.close(w)
         return self._collect(r, pid, nodes, budget, stop_on)
 
-    def run_fresh(self, files, nodes, limits, budget, stop_on=frozenset()):
-        """Write the patched files into a /tmp shadow tree and run the candidates in a
-        fresh interpreter. files: [(path, new_text or None for deleted)]."""
-        self.last_apply_error = False
-        if not nodes:
-            return set(), set()
-        nodes = self._order(nodes, stop_on)
+    def _shadow_write(self, files):
         shadow = os.path.join(os.environ.get("TMPDIR_BR", "/tmp"), "br_shadow")
+        if not os.path.isdir(os.path.join(shadow, "sqlglot")):
+            build_shadow(self.dir, shadow)
+        touched = []
         try:
-            if not os.path.isdir(os.path.join(shadow, "sqlglot")):
-                build_shadow(self.dir, shadow)
-            touched = []
             for path, new in files:
                 dst = os.path.join(shadow, path)
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -436,33 +412,98 @@ class Verifier:
                 if new is not None:
                     with open(dst, "w", encoding="utf-8") as fh:
                         fh.write(new)
+        except OSError:
+            self._shadow_restore(shadow, touched)
+            raise
+        return shadow, touched
+
+    def _shadow_restore(self, shadow, touched):
+        for path in touched:
+            dst = os.path.join(shadow, path)
+            if os.path.lexists(dst):
+                os.unlink(dst)
+            src = os.path.join(self.dir, path)
+            if os.path.exists(src):
+                os.symlink(src, dst)
+
+    def _spawn(self, shadow, mode, w, job):
+        import subprocess
+
+        env = dict(os.environ, SKIP_INTEGRATION="0", PYTHONDONTWRITEBYTECODE="1",
+                   PYTHONPATH=shadow + os.pathsep + os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "blast.verify", mode, str(w)],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            pass_fds=(w,), cwd=shadow, env=env,
+        )
+        os.close(w)
+        proc.stdin.write(json.dumps(job).encode())
+        proc.stdin.close()
+        return proc
+
+    def run_fresh(self, files, nodes, limits, budget, stop_on=frozenset()):
+        """Write the patched files into a /tmp shadow tree and run the candidates in a
+        fresh interpreter. files: [(path, new_text or None for deleted)]."""
+        self.last_apply_error = False
+        if not nodes:
+            return set(), set()
+        nodes = self._order(nodes, stop_on)
+        try:
+            shadow, touched = self._shadow_write(files)
         except OSError as e:
             log(f"verify: shadow tree failed: {e!r}")
             return set(), set(nodes)
-        r, w = os.pipe()
-        env = dict(os.environ, SKIP_INTEGRATION="0", PYTHONDONTWRITEBYTECODE="1",
-                   PYTHONPATH=shadow + os.pathsep + os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        import subprocess
-
-        job = json.dumps({"nodes": nodes, "limits": limits})
         try:
-            proc = subprocess.Popen(
-                [sys.executable, "-m", "blast.verify", "--child", str(w)],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                pass_fds=(w,), cwd=shadow, env=env,
-            )
-            os.close(w)
-            proc.stdin.write(job.encode())
-            proc.stdin.close()
+            r, w = os.pipe()
+            proc = self._spawn(shadow, "--child", w, {"nodes": nodes, "limits": limits})
             return self._collect(r, proc.pid, nodes, budget, stop_on)
         finally:
-            for path in touched:  # restore the shadow tree
-                dst = os.path.join(shadow, path)
-                if os.path.lexists(dst):
-                    os.unlink(dst)
-                src = os.path.join(self.dir, path)
-                if os.path.exists(src):
-                    os.symlink(src, dst)
+            self._shadow_restore(shadow, touched)
+
+    def import_diff(self, files, timeout=20.0):
+        """Keys (see blast.worlddiff) whose value after loading everything differs once
+        `files` are patched, or None if that can't be told."""
+        from blast import worlddiff
+
+        if not self.ok or os.environ.get("PYTHONHASHSEED") is None:
+            return None  # set iteration order must match between parent and child
+        t0 = time.process_time()
+        if getattr(self, "_world", None) is None:
+            self._world = worlddiff.fingerprints(self.dir)
+        try:
+            shadow, touched = self._shadow_write(files)
+        except OSError as e:
+            log(f"verify: shadow tree failed: {e!r}")
+            return None
+        data = b""
+        try:
+            r, w = os.pipe()
+            proc = self._spawn(shadow, "--diff", w, {"test_files": sorted(self.modules_files), "root": shadow})
+            deadline = time.time() + timeout
+            while True:
+                left = deadline - time.time()
+                if left <= 0 or not select.select([r], [], [], left)[0]:
+                    proc.kill()
+                    break
+                chunk = os.read(r, 1 << 16)
+                if not chunk:
+                    break
+                data += chunk
+            proc.wait()
+            os.close(r)
+        finally:
+            self._shadow_restore(shadow, touched)
+        try:
+            other = json.loads(data.decode())
+        except ValueError:
+            log("verify: import diff child failed")
+            return None
+        if not isinstance(other, dict):
+            log(f"verify: import diff child error {other!r}")
+            return None
+        keys = worlddiff.diff(self._world, other)
+        log(f"verify: import diff {len(keys)} keys in {time.process_time() - t0:.2f}s cpu (parent)")
+        return keys
 
     def _collect(self, r, pid, nodes, budget, stop_on=frozenset()):
         failed, passed = set(), set()
@@ -525,6 +566,29 @@ class Verifier:
         return failed, unverified
 
 
+def diff_child_main(fd):
+    """Entry point of an import-diff process: load everything (patched) and fingerprint it."""
+    out = os.fdopen(fd, "w")
+    try:
+        from blast import worlddiff
+
+        job = json.loads(sys.stdin.read())
+        os.environ["SKIP_INTEGRATION"] = "0"
+        root = job["root"]  # as spelled on sys.path (getcwd would resolve /tmp symlinks)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, 1)
+        os.dup2(devnull, 2)
+        worlddiff.load_world(root, job["test_files"])
+        out.write(json.dumps(worlddiff.fingerprints(root)))
+    except BaseException as e:  # noqa: BLE001
+        out.write(json.dumps(f"{type(e).__name__}: {e}"))
+    finally:
+        out.flush()
+        os._exit(0)
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--child":
         fresh_child_main(int(sys.argv[2]))
+    elif len(sys.argv) == 3 and sys.argv[1] == "--diff":
+        diff_child_main(int(sys.argv[2]))
