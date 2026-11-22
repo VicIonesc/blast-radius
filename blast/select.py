@@ -309,13 +309,14 @@ GIANT_PROXIES = {
         "tests/test_optimizer.py::TestOptimizer::test_tpcds",
         "tests/test_optimizer.py::TestOptimizer::test_optimize",
     ),
-}
-if os.environ.get("BR_MAXNODES_PROXIES") == "1":  # under evaluation
-    GIANT_PROXIES["tests/test_parser.py::TestParser::test_max_nodes"] = (
+    # Stress-tested on 40 bugs placed on its lines: 17 broke it, every one also broke
+    # 140+ of these.
+    "tests/test_parser.py::TestParser::test_max_nodes": (
         "tests/test_parser.py::",
         "tests/test_transpile.py::",
         "tests/test_expressions.py::",
-    )
+    ),
+}
 
 # --------------------------------------------------------------------------- the maps
 
