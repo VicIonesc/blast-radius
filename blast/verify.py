@@ -193,6 +193,52 @@ def fresh_child_main(fd):
         os._exit(0)
 
 
+BENCH_SQL = [
+    "SELECT a, SUM(b) AS s FROM t JOIN u ON t.id = u.id WHERE c > 1 GROUP BY a HAVING SUM(b) > 2 ORDER BY s DESC LIMIT 10",
+    "WITH x AS (SELECT * FROM y WHERE z IN (SELECT w FROM v)) SELECT CASE WHEN a THEN 1 ELSE 2 END FROM x",
+    "SELECT DATE_TRUNC('month', ts), COUNT(DISTINCT id) OVER (PARTITION BY k ORDER BY ts) FROM events",
+    "SELECT CAST(a AS DECIMAL(10, 2)), COALESCE(b, c, d), REGEXP_REPLACE(e, 'x+', 'y') FROM tbl",
+    "INSERT INTO t (a, b) SELECT a, b FROM s UNION ALL SELECT c, d FROM r",
+]
+
+
+def bench_once():
+    """A fixed sqlglot workload: parse, transpile and optimize a few queries."""
+    import sqlglot
+    from sqlglot.optimizer import optimize
+
+    for _ in range(3):
+        for q in BENCH_SQL:
+            for dialect in ("duckdb", "snowflake", "bigquery", "tsql"):
+                sqlglot.transpile(q, read="postgres", write=dialect)
+        optimize(sqlglot.parse_one(BENCH_SQL[0]), schema={"t": {"a": "int", "b": "int", "c": "int", "id": "int"},
+                                                          "u": {"id": "int"}})
+
+
+def bench():
+    """CPU seconds of bench_once in a forked child (keeps caches out of the parent).
+    Best of three."""
+    import resource
+
+    best = None
+    for _ in range(3):
+        c0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        pid = os.fork()
+        if pid == 0:
+            try:
+                devnull = os.open(os.devnull, os.O_WRONLY)
+                os.dup2(devnull, 1)
+                os.dup2(devnull, 2)
+                bench_once()
+            finally:
+                os._exit(0)
+        os.waitpid(pid, 0)
+        c1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        t = (c1.ru_utime + c1.ru_stime) - (c0.ru_utime + c0.ru_stime)
+        best = t if best is None else min(best, t)
+    return best
+
+
 # --------------------------------------------------------------------------- verifier
 
 

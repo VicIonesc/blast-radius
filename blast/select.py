@@ -339,6 +339,7 @@ class Maps:
         self._file_union = {}
         self.import_ran = {f: set(v) for f, v in c.get("import_ran", {}).items()}
         self.cpu = {}
+        self.bench_ref = None
         self.class_setup = {}
         cpu_path = os.path.join(MAP_DIR, "cpu.json")
         if os.path.exists(cpu_path):
@@ -346,6 +347,7 @@ class Maps:
                 cj = json.load(fh)
             tid = {t: i for i, t in enumerate(self.tests)}
             self.cpu = {tid[t]: v for t, v in cj["test"].items() if t in tid}
+            self.bench_ref = cj.get("bench")
             self.class_setup = cj.get("class_setup", {})
         self.fixture_readers = {k: set(v) for k, v in m.get("fixture_readers", {}).items()}
         self.traced_classes = set(m.get("traced_classes", []))
@@ -728,7 +730,13 @@ def schedule(nums, runtime):
 
 
 VERIFY = os.environ.get("VERIFY", "1") == "1"
-SLOWDOWN = float(os.environ.get("SLOWDOWN", "1.8"))  # grader CPU vs. the machine cpu.json came from
+# Grader CPU vs. the machine cpu.json came from. "auto": measured at startup with a fixed
+# sqlglot benchmark against the reference time stored in cpu.json.
+SLOWDOWN_SETTING = os.environ.get("SLOWDOWN", "auto")
+SLOWDOWN = 1.8 if SLOWDOWN_SETTING == "auto" else float(SLOWDOWN_SETTING)
+# Real verification runs ~1.3x the per-test numbers (fork copy-on-write, memory effects
+# the small benchmark doesn't feel).
+BENCH_MARGIN = float(os.environ.get("BENCH_MARGIN", "1.35"))
 BATCH_BUDGET = float(os.environ.get("BATCH_BUDGET", "140"))  # wall seconds for verification
 # Tests we never try to verify in-process: they inspect the process itself.
 NEVER_VERIFY = {
@@ -824,7 +832,12 @@ def verify_commit(maps, sel, state, ours, plan, to_theirs, runtime, never, wall0
         if proxies and not any(maps.tests[i] in bad for i in proxies):
             keep.discard(g)
             dropped.append(maps.tests[g].split("::")[-1])
+    classes = {maps.tests[i].rsplit("::", 1)[0] for i in check}
+    predicted = (sum(maps.cpu.get(i, 0) for i in check)
+                 + sum(maps.class_setup.get(c, 0) for c in classes)
+                 + (FRESH_CPU if fresh else FORK_CPU))
     note = (f" {'fresh' if fresh else 'fork'}-verified {len(check)}: {len(failed)} fail,"
+            f" predicted {predicted:.2f}s,"
             f" {len(unverified)} undecided, child cpu {child_cpu:.2f}s"
             + (f" dropped {dropped}" if dropped else ""))
     return keep, note
@@ -851,7 +864,19 @@ def main():
         unknown_by_file.setdefault(f, []).append(num)
 
     never = set(maps.uncovered) | {i for i, t in enumerate(maps.tests) if t in NEVER_VERIFY}
-    state = {}  # holds the Verifier once one is needed
+    state = {}  # holds the Verifier
+    if VERIFY:
+        try:
+            from blast.verify import Verifier, bench
+
+            state["verifier"] = Verifier(SQLGLOT_DIR, sorted({t.split("::")[0] for t in maps.tests}))
+            if SLOWDOWN_SETTING == "auto" and maps.bench_ref and state["verifier"].ok:
+                global SLOWDOWN
+                here = bench()
+                SLOWDOWN = min(5.0, max(0.7, BENCH_MARGIN * here / maps.bench_ref))
+                log(f"cpu benchmark {here:.4f}s vs {maps.bench_ref:.4f}s reference: SLOWDOWN={SLOWDOWN:.2f}")
+        except Exception as e:
+            log(f"verifier setup failed: {e!r}")
 
     commit_dir = os.path.join(DATA_DIR, "commits")
     names = sorted(fn for fn in os.listdir(commit_dir) if fn.endswith(".patch"))
