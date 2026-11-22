@@ -14,6 +14,7 @@ Writes:
 """
 
 import ast
+import importlib
 import json
 import os
 import re
@@ -76,7 +77,13 @@ def main(sqlglot_dir, covmap_path, files_by_test_path, out_path, classes_by_test
     # ---- dialects ---------------------------------------------------------
     from sqlglot.dialects.dialect import Dialect, Dialects
 
-    names = [d.value for d in Dialects if d.value]
+    # The registry, not the Dialects enum: some dialects (e.g. singlestore) aren't in the enum.
+    import pkgutil
+    import sqlglot.dialects as dialect_pkg
+
+    for info in pkgutil.iter_modules(dialect_pkg.__path__):
+        importlib.import_module("sqlglot.dialects." + info.name)
+    names = sorted(k for k in Dialect.classes if k)
     classes = {}
     for n in names:
         try:

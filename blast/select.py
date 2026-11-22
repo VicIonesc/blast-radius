@@ -740,7 +740,6 @@ BENCH_MARGIN = float(os.environ.get("BENCH_MARGIN", "1.35"))
 BATCH_BUDGET = float(os.environ.get("BATCH_BUDGET", "140"))  # wall seconds for verification
 # Tests we never try to verify in-process: they inspect the process itself.
 NEVER_VERIFY = {
-    "tests/test_generator.py::TestGenerator::test_generator_memory",
     "tests/dialects/test_dialect.py::TestDialect::test_lazy_load",
 }
 
